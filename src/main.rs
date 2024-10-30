@@ -1,10 +1,13 @@
+use std::{fs::File, io::Read, net::SocketAddr};
+
 use clap::{Arg, Command};
-use std::net::SocketAddr;
 use tokio::{
     io::{self, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
     time,
 };
+
+mod config;
 
 include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 
@@ -46,7 +49,10 @@ async fn main() -> io::Result<()> {
         let listener = TcpListener::bind(pair.listen)
             .await
             .expect(pair.listen.to_string().as_str());
-        println!("Listening on {} forward to {}", pair.listen, pair.backend);
+        println!(
+            "Listening on {} forward to {} tag={}",
+            pair.listen, pair.backend, pair.tag
+        );
 
         let handle = forward_loop(listener, pair);
         handles.push(tokio::spawn(handle));
@@ -64,7 +70,7 @@ async fn forward_loop(listener: TcpListener, addr_pair: ForwardAddrPair) -> io::
             let start_tm = time::Instant::now();
             let local_addr = stream.0.local_addr().unwrap_or(addr_pair.listen);
             log_new_conn(stream.1, local_addr, addr_pair.backend);
-            match copy_stream(&mut stream.0, addr_pair.backend).await {
+            match forward(&mut stream.0, addr_pair.backend).await {
                 Ok((tx, rx)) => log_close_conn(stream.1, tx, rx, start_tm.elapsed()),
                 Err(e) => log_close_conn_error(stream.1, local_addr, addr_pair.backend, e),
             }
@@ -111,6 +117,7 @@ fn log_close_conn_error(
 struct ForwardAddrPair {
     listen: SocketAddr,
     backend: SocketAddr,
+    tag: String,
 }
 
 fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
@@ -121,6 +128,7 @@ fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
 
     let mut addr_pairs = Vec::new();
 
+    // from '--forward' command line arg.
     if forward_opt.is_some() {
         for addr_pair_str in forward_opt.unwrap() {
             let parts: Vec<&str> = addr_pair_str.split(',').collect();
@@ -136,10 +144,12 @@ fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
                 backend: parts[1]
                     .parse::<SocketAddr>()
                     .expect(format!("invalid backend-addr '{}'", parts[1]).as_str()),
+                tag: String::from("CMD"),
             });
         }
     }
 
+    // from '--listen-addr', '--listen-port' and '--backend-addr' command line args.
     if listen_addr_opt.is_some() || listen_port_opt.is_some() || backend_addr_opt.is_some() {
         let listen_addr = if listen_addr_opt.is_some() {
             listen_addr_opt
@@ -160,7 +170,27 @@ fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
         addr_pairs.push(ForwardAddrPair {
             listen: listen_addr,
             backend: backend_addr,
+            tag: String::from("CMD"),
         });
+    }
+
+    // from ENV VAR 'PROCY_FORWARD_ADDR_PATH'
+    if let Ok(addr_conf_path) = std::env::var(config::PROCY_CONFIG_PATH_ENV) {
+        let mut file = File::open(&addr_conf_path).expect(&addr_conf_path);
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).expect(&addr_conf_path);
+        let conf: config::Config = toml::from_str(&contents).expect(&addr_conf_path);
+        for pair in conf.forward_addr_pairs {
+            addr_pairs.push(ForwardAddrPair {
+                listen: pair.listen_addr.parse::<SocketAddr>().expect(
+                    format!("invalid env conf listen-addr '{}'", pair.listen_addr).as_str(),
+                ),
+                backend: pair.backend_addr.parse::<SocketAddr>().expect(
+                    format!("invalid env conf backend-addr '{}'", pair.listen_addr).as_str(),
+                ),
+                tag: String::from("ENV"),
+            });
+        }
     }
 
     addr_pairs
@@ -182,7 +212,7 @@ async fn connect_with_local_addr(
     Ok(socket.connect(backend_addr).await?)
 }
 
-async fn copy_stream(
+async fn forward(
     client_stream: &mut TcpStream,
     backend_addr: SocketAddr,
 ) -> io::Result<(u64, u64)> {

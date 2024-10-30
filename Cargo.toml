@@ -4,7 +4,9 @@ edition = "2021"
 
 [dependencies]
 clap = "4.5.9"
+serde = { version = "1.0.214", features = ["derive"] }
 tokio = { version = "1.41.0", features = ["full"] }
+toml = "0.8.19"
 
 [build-dependencies]
 chrono = "0.4"
