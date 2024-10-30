@@ -17,74 +17,153 @@ async fn main() -> io::Result<()> {
             Arg::new("backend-addr")
                 .long("backend-addr")
                 .value_name("ADDR")
-                .help("Remote address to forward to (e.g., 127.0.0.1:8080)")
-                .required(true),
+                .help("Remote address (format 'ip:port') to forward to"),
         )
         .arg(
             Arg::new("listen-addr")
                 .long("listen-addr")
                 .value_name("ADDR")
-                .help("Address to listen on (e.g., 192.168.110.200:8080)"),
+                .help("Address (format 'ip:port') to listen on"),
         )
         .arg(
             Arg::new("listen-port")
                 .long("listen-port")
                 .value_name("PORT")
-                .help("Port to listen on (e.g., 8080)"),
+                .help("Port to listen on"),
+        )
+        .arg(
+            Arg::new("forward")
+                .long("forward")
+                .value_names(["listen-addr,backend-addr"])
+                .num_args(0..)
+                .help("Multiple listen-addr and backend-addr combinations"),
         )
         .get_matches();
 
-    let backend_addr_opt = matches.get_one::<String>("backend-addr");
-    let listen_addr_opt = matches.get_one::<String>("listen-addr");
-    let listen_port_opt = matches.get_one::<String>("listen-port");
+    let addr_pairs = get_addr_pairs(&matches);
+    let mut handles = Vec::new();
+    for pair in addr_pairs {
+        let listener = TcpListener::bind(pair.listen)
+            .await
+            .expect(pair.listen.to_string().as_str());
+        println!("Listening on {} forward to {}", pair.listen, pair.backend);
 
-    let listen_addr = if listen_addr_opt.is_some() {
-        listen_addr_opt
-            .unwrap()
-            .parse::<SocketAddr>()
-            .expect(format!("invalid listen-addr '{}'", listen_addr_opt.unwrap()).as_str())
-    } else {
-        format!("[::]:{}", listen_port_opt.unwrap())
-            .parse::<SocketAddr>()
-            .expect(format!("invalid listen-port '{}'", listen_port_opt.unwrap()).as_str())
-    };
-    let backend_addr = backend_addr_opt
-        .unwrap()
-        .parse::<SocketAddr>()
-        .expect(format!("invalid backend-addr '{}'", backend_addr_opt.unwrap()).as_str());
+        let handle = forward_loop(listener, pair);
+        handles.push(tokio::spawn(handle));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+    Ok(())
+}
 
-    let listener = TcpListener::bind(listen_addr).await?;
-    println!("Listening on {}", listen_addr);
-
+async fn forward_loop(listener: TcpListener, addr_pair: ForwardAddrPair) -> io::Result<()> {
     loop {
-        let mut client_stream = listener.accept().await?;
+        let mut stream = listener.accept().await?;
         tokio::spawn(async move {
             let start_tm = time::Instant::now();
-            let client_local_addr = client_stream.0.local_addr().unwrap_or(listen_addr);
-            println!(
-                "New conn from={} via={} to={}",
-                client_stream.1, client_local_addr, backend_addr
-            );
-
-            match copy_stream(&mut client_stream.0, backend_addr).await {
-                Ok((tx, rx)) => {
-                    println!(
-                        "Closed conn from={} send_bytes={} recv_bytes={} duration={:?} ",
-                        client_stream.1,
-                        tx,
-                        rx,
-                        start_tm.elapsed(),
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Fail to forward from={} via={} to={} error={}",
-                        client_stream.1, client_local_addr, backend_addr, e
-                    )
-                }
+            let local_addr = stream.0.local_addr().unwrap_or(addr_pair.listen);
+            log_new_conn(stream.1, local_addr, addr_pair.backend);
+            match copy_stream(&mut stream.0, addr_pair.backend).await {
+                Ok((tx, rx)) => log_close_conn(stream.1, tx, rx, start_tm.elapsed()),
+                Err(e) => log_close_conn_error(stream.1, local_addr, addr_pair.backend, e),
             }
         });
     }
+}
+
+fn log_new_conn(
+    client_remote_addr: SocketAddr,
+    client_local_addr: SocketAddr,
+    backend_addr: SocketAddr,
+) {
+    println!(
+        "New conn from={} via={} to={}",
+        client_remote_addr, client_local_addr, backend_addr
+    );
+}
+
+fn log_close_conn(
+    client_remote_addr: SocketAddr,
+    tx_bytes: u64,
+    rx_bytes: u64,
+    dur: time::Duration,
+) {
+    println!(
+        "Closed conn from={} tx={} rx={} duration={:?} ",
+        client_remote_addr, tx_bytes, rx_bytes, dur,
+    );
+}
+
+fn log_close_conn_error(
+    client_remote_addr: SocketAddr,
+    client_local_addr: SocketAddr,
+    backend_addr: SocketAddr,
+    e: std::io::Error,
+) {
+    eprintln!(
+        "Fail to forward from={} via={} to={} error={}",
+        client_remote_addr, client_local_addr, backend_addr, e
+    )
+}
+
+#[derive(Debug)]
+struct ForwardAddrPair {
+    listen: SocketAddr,
+    backend: SocketAddr,
+}
+
+fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
+    let backend_addr_opt = matches.get_one::<String>("backend-addr");
+    let listen_addr_opt = matches.get_one::<String>("listen-addr");
+    let listen_port_opt = matches.get_one::<String>("listen-port");
+    let forward_opt = matches.get_many::<String>("forward");
+
+    let mut addr_pairs = Vec::new();
+
+    if forward_opt.is_some() {
+        for addr_pair_str in forward_opt.unwrap() {
+            let parts: Vec<&str> = addr_pair_str.split(',').collect();
+            if parts.len() != 2 {
+                eprintln!("Invalid forward rule format: {}", addr_pair_str);
+                std::process::exit(1);
+            }
+
+            addr_pairs.push(ForwardAddrPair {
+                listen: parts[0]
+                    .parse::<SocketAddr>()
+                    .expect(format!("invalid listen-addr '{}'", parts[0]).as_str()),
+                backend: parts[1]
+                    .parse::<SocketAddr>()
+                    .expect(format!("invalid backend-addr '{}'", parts[1]).as_str()),
+            });
+        }
+    }
+
+    if listen_addr_opt.is_some() || listen_port_opt.is_some() || backend_addr_opt.is_some() {
+        let listen_addr = if listen_addr_opt.is_some() {
+            listen_addr_opt
+                .unwrap()
+                .parse::<SocketAddr>()
+                .expect(format!("invalid listen-addr '{}'", listen_addr_opt.unwrap()).as_str())
+        } else {
+            format!("[::]:{}", listen_port_opt.unwrap())
+                .parse::<SocketAddr>()
+                .expect(format!("invalid listen-port '{}'", listen_port_opt.unwrap()).as_str())
+        };
+
+        let backend_addr = backend_addr_opt
+            .unwrap()
+            .parse::<SocketAddr>()
+            .expect(format!("invalid backend-addr '{}'", backend_addr_opt.unwrap()).as_str());
+
+        addr_pairs.push(ForwardAddrPair {
+            listen: listen_addr,
+            backend: backend_addr,
+        });
+    }
+
+    addr_pairs
 }
 
 async fn connect_with_local_addr(

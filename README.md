@@ -21,6 +21,11 @@ IPv6 also supports.
 $ procy --listen-addr [::]:10022 --backend-addr 127.0.0.1:22
 ```
 
+Specify multi address pair for fowarding.
+```shell
+$ procy --forward 192.168.10.2:10022,127.0.0.1:22
+$ procy --forward 192.168.10.2:10022,127.0.0.1:22 192.168.10.2:10023,127.0.0.1:22
+```
+
 ## TODO
-- Support for proxies with multiple addresses.
 - Support specify backend connection local address.
