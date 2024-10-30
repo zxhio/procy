@@ -6,12 +6,13 @@ use tokio::{
     time,
 };
 
+include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // 设置命令行参数
-    let matches = Command::new("Procy")
-        .version("0.1.0")
+    let matches = Command::new("procy")
         .about("A simple proxy server")
+        .version(COMMIT_VERSION_INFO)
         .arg(
             Arg::new("backend-addr")
                 .long("backend-addr")

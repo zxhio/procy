@@ -1,0 +1,121 @@
+name: Build Procy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+jobs:
+  get-build-info:
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.tag.outputs.BUILD_VERSION }}
+
+    steps:
+      - name: Get build version
+        id: tag
+        run: echo "BUILD_VERSION=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: get-build-info
+    env:
+      RUST_BACKTRACE: full
+      BUILD_VERSION: ${{ needs.get-build-info.outputs.build_version }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Build for ${{ matrix.os }}-${{ matrix.target }}
+        if: matrix.os != 'windows-latest'
+        run: |
+          if [[ "${{ matrix.target }}" == *"aarch64"* && "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            cargo install cross
+            cross build --target ${{ matrix.target }} --release
+          else
+            cargo build --target ${{ matrix.target }} --release
+          fi
+
+      - name: Build for Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          cargo build --target ${{ matrix.target }} --release
+
+      - name: Pack artifacts for *nix
+        if: matrix.os != 'windows-latest' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p procy
+          cp target/${{ matrix.target }}/release/procy procy
+          tar -czvf procy-${{ needs.get-build-info.outputs.build_version }}-${{ matrix.target }}.tar.gz procy
+
+      - name: Pack artifacts for Windows
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p procy
+          cp target\${{ matrix.target }}\release\procy.exe procy
+          Compress-Archive -Path 'procy\*' -DestinationPath "procy-${{ needs.get-build-info.outputs.build_version }}-${{ matrix.target }}.zip"
+
+      - name: Upload artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: procy-${{ matrix.target }}
+          path: procy-${{ needs.get-build-info.outputs.build_version }}-${{ matrix.target }}.*
+
+  release:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: [get-build-info, build]
+    strategy:
+      matrix:
+        target: [
+          "x86_64-unknown-linux-musl",
+          "aarch64-unknown-linux-musl",
+          "x86_64-apple-darwin",
+          "aarch64-apple-darwin",
+          "x86_64-pc-windows-msvc",
+        ]
+
+    steps:
+      - name: Download ${{ matrix.target }} artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: procy-${{ matrix.target }}
+
+      - name: Upload Release Assets
+        id: upload_release_asset
+        uses: svenstaro/upload-release-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: ${{ needs.get-build-info.outputs.build_version }}
+          file: procy-${{ needs.get-build-info.outputs.build_version }}-${{ matrix.target }}.*
+          overwrite: true
+          file_glob: true
