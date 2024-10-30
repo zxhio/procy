@@ -35,6 +35,10 @@ In the case of a daemon, the configuration file can be specified through environ
 
 This is an example of a **procy** configuration where two forwarding address pairs have been configured. 
 ```toml
+[log]
+log_level="debug"
+log_path="/path/to/log"
+
 [[forward_addr_pairs]]
 listen_addr = "192.168.32.251:10022"
 backend_addr = "127.0.0.1:22"

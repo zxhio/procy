@@ -4,6 +4,9 @@ edition = "2021"
 
 [dependencies]
 clap = "4.5.9"
+env_logger = "0.11.5"
+file-rotate = "0.7.6"
+log = "0.4.22"
 serde = { version = "1.0.214", features = ["derive"] }
 tokio = { version = "1.41.0", features = ["full"] }
 toml = "0.8.19"

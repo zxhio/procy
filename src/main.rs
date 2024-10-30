@@ -1,6 +1,7 @@
-use std::{fs::File, io::Read, net::SocketAddr};
+use std::{error, io::Write, net::SocketAddr};
 
 use clap::{Arg, Command};
+use log::{debug, error, info};
 use tokio::{
     io::{self, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
@@ -12,7 +13,7 @@ mod config;
 include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn error::Error>> {
     let matches = Command::new("procy")
         .about("A simple proxy server")
         .version(COMMIT_VERSION_INFO)
@@ -43,13 +44,18 @@ async fn main() -> io::Result<()> {
         )
         .get_matches();
 
-    let addr_pairs = get_addr_pairs(&matches);
+    let conf = config::Config::new(config::PROCY_CONFIG_PATH_ENV)?;
+    set_logging(&conf);
+
+    info!("procy {}", COMMIT_VERSION_INFO);
+
+    let addr_pairs = get_addr_pairs(&matches, &conf);
     let mut handles = Vec::new();
     for pair in addr_pairs {
         let listener = TcpListener::bind(pair.listen)
             .await
             .expect(pair.listen.to_string().as_str());
-        println!(
+        info!(
             "Listening on {} forward to {} tag={}",
             pair.listen, pair.backend, pair.tag
         );
@@ -83,7 +89,7 @@ fn log_new_conn(
     client_local_addr: SocketAddr,
     backend_addr: SocketAddr,
 ) {
-    println!(
+    info!(
         "New conn from={} via={} to={}",
         client_remote_addr, client_local_addr, backend_addr
     );
@@ -95,7 +101,7 @@ fn log_close_conn(
     rx_bytes: u64,
     dur: time::Duration,
 ) {
-    println!(
+    debug!(
         "Closed conn from={} tx={} rx={} duration={:?} ",
         client_remote_addr, tx_bytes, rx_bytes, dur,
     );
@@ -107,7 +113,7 @@ fn log_close_conn_error(
     backend_addr: SocketAddr,
     e: std::io::Error,
 ) {
-    eprintln!(
+    error!(
         "Fail to forward from={} via={} to={} error={}",
         client_remote_addr, client_local_addr, backend_addr, e
     )
@@ -120,7 +126,7 @@ struct ForwardAddrPair {
     tag: String,
 }
 
-fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
+fn get_addr_pairs(matches: &clap::ArgMatches, conf: &config::Config) -> Vec<ForwardAddrPair> {
     let backend_addr_opt = matches.get_one::<String>("backend-addr");
     let listen_addr_opt = matches.get_one::<String>("listen-addr");
     let listen_port_opt = matches.get_one::<String>("listen-port");
@@ -133,7 +139,7 @@ fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
         for addr_pair_str in forward_opt.unwrap() {
             let parts: Vec<&str> = addr_pair_str.split(',').collect();
             if parts.len() != 2 {
-                eprintln!("Invalid forward rule format: {}", addr_pair_str);
+                error!("Invalid forward rule format: {}", addr_pair_str);
                 std::process::exit(1);
             }
 
@@ -174,23 +180,19 @@ fn get_addr_pairs(matches: &clap::ArgMatches) -> Vec<ForwardAddrPair> {
         });
     }
 
-    // from ENV VAR 'PROCY_FORWARD_ADDR_PATH'
-    if let Ok(addr_conf_path) = std::env::var(config::PROCY_CONFIG_PATH_ENV) {
-        let mut file = File::open(&addr_conf_path).expect(&addr_conf_path);
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).expect(&addr_conf_path);
-        let conf: config::Config = toml::from_str(&contents).expect(&addr_conf_path);
-        for pair in conf.forward_addr_pairs {
-            addr_pairs.push(ForwardAddrPair {
-                listen: pair.listen_addr.parse::<SocketAddr>().expect(
-                    format!("invalid env conf listen-addr '{}'", pair.listen_addr).as_str(),
-                ),
-                backend: pair.backend_addr.parse::<SocketAddr>().expect(
-                    format!("invalid env conf backend-addr '{}'", pair.listen_addr).as_str(),
-                ),
-                tag: String::from("ENV"),
-            });
-        }
+    // from config file
+    for pair in &conf.forward_addr_pairs {
+        addr_pairs.push(ForwardAddrPair {
+            listen: pair
+                .listen_addr
+                .parse::<SocketAddr>()
+                .expect(format!("invalid env conf listen-addr '{}'", pair.listen_addr).as_str()),
+            backend: pair
+                .backend_addr
+                .parse::<SocketAddr>()
+                .expect(format!("invalid env conf backend-addr '{}'", pair.listen_addr).as_str()),
+            tag: String::from("ENV"),
+        });
     }
 
     addr_pairs
@@ -221,4 +223,62 @@ async fn forward(
     let _ = client_stream.shutdown().await;
     let _ = backend_conn.shutdown().await;
     Ok((tx, rx))
+}
+
+fn set_logging(conf: &config::Config) {
+    if conf.log.is_none() {
+        return;
+    }
+
+    let log_level = conf.log.as_ref().unwrap().log_level.to_string();
+    let log_path = conf.log.as_ref().unwrap().log_path.to_string();
+
+    let log_env = if log_level.is_empty() {
+        env_logger::Env::new().filter_or(env_logger::DEFAULT_FILTER_ENV, "info")
+    } else {
+        env_logger::Env::new().filter_or(env_logger::DEFAULT_FILTER_ENV, log_level)
+    };
+
+    let mut builder = env_logger::Builder::from_env(log_env);
+    if !log_path.is_empty() {
+        builder.target(env_logger::Target::Pipe(Box::new(LoggerWriter::new(
+            &log_path,
+        ))));
+    }
+
+    builder
+        .format_level(true)
+        .format_timestamp_millis()
+        .format_target(false)
+        .init();
+}
+
+struct LoggerWriter {
+    pub f: file_rotate::FileRotate<file_rotate::suffix::AppendTimestamp>,
+}
+
+impl LoggerWriter {
+    fn new(path: &str) -> Self {
+        let f = file_rotate::FileRotate::new(
+            path,
+            file_rotate::suffix::AppendTimestamp::default(
+                file_rotate::suffix::FileLimit::MaxFiles(10),
+            ),
+            file_rotate::ContentLimit::Bytes(1024 * 1024 * 10),
+            file_rotate::compression::Compression::None,
+            #[cfg(unix)]
+            None,
+        );
+        LoggerWriter { f }
+    }
+}
+
+impl Write for LoggerWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.f.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
