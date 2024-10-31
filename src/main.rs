@@ -1,4 +1,8 @@
-use std::{error, io::Write, net::SocketAddr};
+use std::{
+    error,
+    io::Write,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use clap::{Arg, Command};
 use log::{debug, error, info};
@@ -20,14 +24,26 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         .arg(
             Arg::new("backend-addr")
                 .long("backend-addr")
-                .value_name("ADDR")
-                .help("Remote address (format 'ip:port') to forward to"),
+                .value_name("IP:PORT")
+                .help("Destination address of the backend connection"),
+        )
+        .arg(
+            Arg::new("source-addr")
+                .long("source-addr")
+                .value_name("IP:PORT")
+                .help("Source address of the backend connection"),
+        )
+        .arg(
+            Arg::new("source-port")
+                .long("source-port")
+                .value_name("PORT")
+                .help("Source port of the backend connection"),
         )
         .arg(
             Arg::new("listen-addr")
                 .long("listen-addr")
-                .value_name("ADDR")
-                .help("Address (format 'ip:port') to listen on"),
+                .value_name("IP:PORT")
+                .help("Address to listen on"),
         )
         .arg(
             Arg::new("listen-port")
@@ -38,9 +54,9 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         .arg(
             Arg::new("forward")
                 .long("forward")
-                .value_names(["listen-addr,backend-addr"])
+                .value_names(&["listen,[source,]backend"])
                 .num_args(0..)
-                .help("Multiple listen-addr and backend-addr combinations"),
+                .help("Multi forward addresses combinations"),
         )
         .get_matches();
 
@@ -49,18 +65,18 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     info!("procy {}", COMMIT_VERSION_INFO);
 
-    let addr_pairs = get_addr_pairs(&matches, &conf);
+    let addr_tuples = get_forward_addr_tuples(&matches, &conf);
     let mut handles = Vec::new();
-    for pair in addr_pairs {
-        let listener = TcpListener::bind(pair.listen)
+    for addr_tuple in addr_tuples {
+        let listener = TcpListener::bind(addr_tuple.listen)
             .await
-            .expect(pair.listen.to_string().as_str());
+            .expect(format!("addr={}, tag={}", addr_tuple.listen, addr_tuple.tag).as_str());
         info!(
             "Listening on {} forward to {} tag={}",
-            pair.listen, pair.backend, pair.tag
+            addr_tuple.listen, addr_tuple.backend, addr_tuple.tag
         );
 
-        let handle = forward_loop(listener, pair);
+        let handle = forward_loop(listener, addr_tuple);
         handles.push(tokio::spawn(handle));
     }
     for handle in handles {
@@ -69,137 +85,214 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-async fn forward_loop(listener: TcpListener, addr_pair: ForwardAddrPair) -> io::Result<()> {
+async fn forward_loop(listener: TcpListener, addr_tuple: ForwardAddrTuple) -> io::Result<()> {
     loop {
         let mut stream = listener.accept().await?;
         tokio::spawn(async move {
             let start_tm = time::Instant::now();
-            let local_addr = stream.0.local_addr().unwrap_or(addr_pair.listen);
-            log_new_conn(stream.1, local_addr, addr_pair.backend);
-            match forward(&mut stream.0, addr_pair.backend).await {
+            let local_addr = stream.0.local_addr().unwrap_or(addr_tuple.listen);
+            log_new_conn(stream.1, local_addr, addr_tuple.backend);
+            match forward(&mut stream.0, addr_tuple.source, addr_tuple.backend).await {
                 Ok((tx, rx)) => log_close_conn(stream.1, tx, rx, start_tm.elapsed()),
-                Err(e) => log_close_conn_error(stream.1, local_addr, addr_pair.backend, e),
+                Err(e) => log_close_conn_error(stream.1, local_addr, addr_tuple.backend, e),
             }
         });
     }
 }
 
-fn log_new_conn(
-    client_remote_addr: SocketAddr,
-    client_local_addr: SocketAddr,
-    backend_addr: SocketAddr,
-) {
+fn log_new_conn(remote_addr: SocketAddr, local_addr: SocketAddr, backend_addr: SocketAddr) {
     info!(
         "New conn from={} via={} to={}",
-        client_remote_addr, client_local_addr, backend_addr
+        remote_addr, local_addr, backend_addr
     );
 }
 
-fn log_close_conn(
-    client_remote_addr: SocketAddr,
-    tx_bytes: u64,
-    rx_bytes: u64,
-    dur: time::Duration,
-) {
+fn log_close_conn(client_remote_addr: SocketAddr, tx: u64, rx: u64, dur: time::Duration) {
     debug!(
         "Closed conn from={} tx={} rx={} duration={:?} ",
-        client_remote_addr, tx_bytes, rx_bytes, dur,
+        client_remote_addr, tx, rx, dur,
     );
 }
 
 fn log_close_conn_error(
-    client_remote_addr: SocketAddr,
-    client_local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
     backend_addr: SocketAddr,
     e: std::io::Error,
 ) {
     error!(
         "Fail to forward from={} via={} to={} error={}",
-        client_remote_addr, client_local_addr, backend_addr, e
+        remote_addr, local_addr, backend_addr, e
     )
 }
 
 #[derive(Debug)]
-struct ForwardAddrPair {
+struct ForwardAddrTuple {
     listen: SocketAddr,
     backend: SocketAddr,
+    source: Option<SocketAddr>,
     tag: String,
 }
 
-fn get_addr_pairs(matches: &clap::ArgMatches, conf: &config::Config) -> Vec<ForwardAddrPair> {
+fn get_forward_addr_tuples(
+    matches: &clap::ArgMatches,
+    conf: &config::Config,
+) -> Vec<ForwardAddrTuple> {
+    let mut tuples = get_addr_tuples_by_addr_args(matches);
+    tuples.extend(get_addr_tuples_by_forward_args(matches));
+    tuples.extend(get_addr_tuples_by_config_file(conf));
+    tuples
+}
+
+// from '--listen-addr', '--listen-port', '--source-addr', '--source-port' and '--backend-addr' command line args.
+fn get_addr_tuples_by_addr_args(matches: &clap::ArgMatches) -> Vec<ForwardAddrTuple> {
     let backend_addr_opt = matches.get_one::<String>("backend-addr");
     let listen_addr_opt = matches.get_one::<String>("listen-addr");
     let listen_port_opt = matches.get_one::<String>("listen-port");
-    let forward_opt = matches.get_many::<String>("forward");
+    let source_addr_opt = matches.get_one::<String>("source-addr");
+    let source_port_opt = matches.get_one::<String>("source-port");
 
-    let mut addr_pairs = Vec::new();
+    let mut addr_tuples = Vec::new();
 
-    // from '--forward' command line arg.
-    if forward_opt.is_some() {
-        for addr_pair_str in forward_opt.unwrap() {
-            let parts: Vec<&str> = addr_pair_str.split(',').collect();
-            if parts.len() != 2 {
-                error!("Invalid forward rule format: {}", addr_pair_str);
-                std::process::exit(1);
-            }
-
-            addr_pairs.push(ForwardAddrPair {
-                listen: parts[0]
-                    .parse::<SocketAddr>()
-                    .expect(format!("invalid listen-addr '{}'", parts[0]).as_str()),
-                backend: parts[1]
-                    .parse::<SocketAddr>()
-                    .expect(format!("invalid backend-addr '{}'", parts[1]).as_str()),
-                tag: String::from("CMD"),
-            });
-        }
+    if listen_addr_opt.is_none()
+        && listen_port_opt.is_none()
+        && source_addr_opt.is_none()
+        && source_port_opt.is_none()
+        && backend_addr_opt.is_none()
+    {
+        return addr_tuples;
     }
 
-    // from '--listen-addr', '--listen-port' and '--backend-addr' command line args.
-    if listen_addr_opt.is_some() || listen_port_opt.is_some() || backend_addr_opt.is_some() {
-        let listen_addr = if listen_addr_opt.is_some() {
-            listen_addr_opt
-                .unwrap()
-                .parse::<SocketAddr>()
-                .expect(format!("invalid listen-addr '{}'", listen_addr_opt.unwrap()).as_str())
-        } else {
-            format!("[::]:{}", listen_port_opt.unwrap())
-                .parse::<SocketAddr>()
-                .expect(format!("invalid listen-port '{}'", listen_port_opt.unwrap()).as_str())
-        };
-
-        let backend_addr = backend_addr_opt
+    let listen_addr = if listen_addr_opt.is_some() {
+        listen_addr_opt
             .unwrap()
             .parse::<SocketAddr>()
-            .expect(format!("invalid backend-addr '{}'", backend_addr_opt.unwrap()).as_str());
+            .expect(format!("invalid listen-addr '{}'", listen_addr_opt.unwrap()).as_str())
+    } else {
+        format!("[::]:{}", listen_port_opt.unwrap())
+            .parse::<SocketAddr>()
+            .expect(format!("invalid listen-port '{}'", listen_port_opt.unwrap()).as_str())
+    };
 
-        addr_pairs.push(ForwardAddrPair {
-            listen: listen_addr,
-            backend: backend_addr,
-            tag: String::from("CMD"),
-        });
-    }
+    let backend_addr = backend_addr_opt
+        .unwrap()
+        .parse::<SocketAddr>()
+        .expect(format!("invalid backend-addr '{}'", backend_addr_opt.unwrap()).as_str());
 
-    // from config file
-    for pair in &conf.forward_addr_pairs {
-        addr_pairs.push(ForwardAddrPair {
-            listen: pair
-                .listen_addr
+    let source_addr = if source_addr_opt.is_some() {
+        Some(
+            source_addr_opt
+                .unwrap()
                 .parse::<SocketAddr>()
-                .expect(format!("invalid env conf listen-addr '{}'", pair.listen_addr).as_str()),
-            backend: pair
-                .backend_addr
-                .parse::<SocketAddr>()
-                .expect(format!("invalid env conf backend-addr '{}'", pair.listen_addr).as_str()),
-            tag: String::from("ENV"),
-        });
-    }
+                .expect(format!("invalid source-addr '{}'", source_addr_opt.unwrap()).as_str()),
+        )
+    } else if source_port_opt.is_some() {
+        let port = source_port_opt
+            .unwrap()
+            .parse::<u16>()
+            .expect(format!("invalid source-port '{}'", source_port_opt.unwrap()).as_str());
 
-    addr_pairs
+        if backend_addr.is_ipv6() {
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from_bits(0)), port))
+        } else {
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(0)), port))
+        }
+    } else {
+        None
+    };
+
+    addr_tuples.push(ForwardAddrTuple {
+        listen: listen_addr,
+        source: source_addr,
+        backend: backend_addr,
+        tag: String::from("args-addr"),
+    });
+    addr_tuples
 }
 
-async fn connect_with_local_addr(
-    local_addr: Option<SocketAddr>,
+// from '--forward' command line arg.
+fn get_addr_tuples_by_forward_args(matches: &clap::ArgMatches) -> Vec<ForwardAddrTuple> {
+    let forward_opt = matches.get_many::<String>("forward");
+
+    let mut addr_tuples = Vec::new();
+    if forward_opt.is_none() {
+        return addr_tuples;
+    }
+
+    for addr_pair_str in forward_opt.unwrap() {
+        let parts: Vec<&str> = addr_pair_str.split(',').collect();
+        if parts.len() != 2 && parts.len() != 3 {
+            error!("Invalid forward rule format: {}", addr_pair_str);
+            std::process::exit(1);
+        }
+
+        let listen_addr = parts[0]
+            .parse::<SocketAddr>()
+            .expect(format!("invalid listen-addr '{}'", parts[0]).as_str());
+
+        let source_addr = if parts.len() == 3 {
+            Some(
+                parts[1]
+                    .parse::<SocketAddr>()
+                    .expect(format!("invalid source-addr '{}'", parts[0]).as_str()),
+            )
+        } else {
+            None
+        };
+
+        let backend_addr_str = if parts.len() == 2 { parts[1] } else { parts[2] };
+        let backend_addr = backend_addr_str
+            .parse::<SocketAddr>()
+            .expect(format!("invalid backend-addr '{}'", parts[1]).as_str());
+
+        addr_tuples.push(ForwardAddrTuple {
+            listen: listen_addr,
+            source: source_addr,
+            backend: backend_addr,
+            tag: String::from("args-forward"),
+        });
+    }
+
+    addr_tuples
+}
+
+fn get_addr_tuples_by_config_file(conf: &config::Config) -> Vec<ForwardAddrTuple> {
+    let mut addr_tuples = Vec::new();
+    for tuple in &conf.forward_addresses {
+        let listen_addr = match tuple.listen_addr {
+            Some(addr) => addr,
+            None => format!("[::]:{}", tuple.listen_port.unwrap())
+                .parse::<SocketAddr>()
+                .expect(format!("invalid listen-port '{}'", tuple.listen_port.unwrap()).as_str()),
+        };
+
+        let source_addr = match tuple.source_addr {
+            Some(addr) => Some(addr),
+            None => match tuple.source_port {
+                Some(port) => {
+                    if tuple.backend_addr.is_ipv6() {
+                        Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from_bits(0)), port))
+                    } else {
+                        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(0)), port))
+                    }
+                }
+                None => None,
+            },
+        };
+
+        addr_tuples.push(ForwardAddrTuple {
+            listen: listen_addr,
+            source: source_addr,
+            backend: tuple.backend_addr,
+            tag: String::from("config"),
+        });
+    }
+
+    addr_tuples
+}
+
+async fn connect_with_source_addr(
+    source_addr: Option<SocketAddr>,
     backend_addr: SocketAddr,
 ) -> io::Result<TcpStream> {
     let socket = if backend_addr.is_ipv6() {
@@ -208,7 +301,8 @@ async fn connect_with_local_addr(
         TcpSocket::new_v4()?
     };
 
-    if let Some(addr) = local_addr {
+    if let Some(addr) = source_addr {
+        socket.set_reuseaddr(true)?;
         socket.bind(addr)?;
     }
     Ok(socket.connect(backend_addr).await?)
@@ -216,9 +310,10 @@ async fn connect_with_local_addr(
 
 async fn forward(
     client_stream: &mut TcpStream,
+    source_addr: Option<SocketAddr>,
     backend_addr: SocketAddr,
 ) -> io::Result<(u64, u64)> {
-    let mut backend_conn = connect_with_local_addr(None, backend_addr).await?;
+    let mut backend_conn = connect_with_source_addr(source_addr, backend_addr).await?;
     let (tx, rx) = io::copy_bidirectional(client_stream, &mut backend_conn).await?;
     let _ = client_stream.shutdown().await;
     let _ = backend_conn.shutdown().await;
@@ -226,24 +321,22 @@ async fn forward(
 }
 
 fn set_logging(conf: &config::Config) {
-    if conf.log.is_none() {
-        return;
-    }
+    let log_conf = match &conf.logging {
+        Some(c) => c.clone(),
+        None => config::LoggingConfig {
+            path: None,
+            level: None,
+        },
+    };
 
-    let log_level = conf.log.as_ref().unwrap().log_level.to_string();
-    let log_path = conf.log.as_ref().unwrap().log_path.to_string();
-
-    let log_env = if log_level.is_empty() {
-        env_logger::Env::new().filter_or(env_logger::DEFAULT_FILTER_ENV, "info")
-    } else {
-        env_logger::Env::new().filter_or(env_logger::DEFAULT_FILTER_ENV, log_level)
+    let log_env = match log_conf.level {
+        Some(level) => env_logger::Env::new().filter_or(env_logger::DEFAULT_FILTER_ENV, level),
+        None => env_logger::Env::new().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
     };
 
     let mut builder = env_logger::Builder::from_env(log_env);
-    if !log_path.is_empty() {
-        builder.target(env_logger::Target::Pipe(Box::new(LoggerWriter::new(
-            &log_path,
-        ))));
+    if let Some(path) = &log_conf.path {
+        builder.target(env_logger::Target::Pipe(Box::new(LoggerWriter::new(path))));
     }
 
     builder
