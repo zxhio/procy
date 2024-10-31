@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             Arg::new("forward")
                 .long("forward")
                 .value_names(&["listen,[source,]backend"])
-                .num_args(0..)
+                .num_args(1..)
                 .help("Multi forward addresses combinations"),
         )
         .get_matches();
@@ -219,10 +219,10 @@ fn get_addr_tuples_by_forward_args(matches: &clap::ArgMatches) -> Vec<ForwardAdd
         return addr_tuples;
     }
 
-    for addr_pair_str in forward_opt.unwrap() {
-        let parts: Vec<&str> = addr_pair_str.split(',').collect();
+    for addr_tuple_str in forward_opt.unwrap() {
+        let parts: Vec<&str> = addr_tuple_str.split(',').collect();
         if parts.len() != 2 && parts.len() != 3 {
-            error!("Invalid forward rule format: {}", addr_pair_str);
+            error!("Invalid forward rule format: {}", addr_tuple_str);
             std::process::exit(1);
         }
 
